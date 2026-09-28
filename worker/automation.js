@@ -4,7 +4,8 @@ import path from "node:path";
 import { companyQuestion, eligibleProseField, highValueOptionalProseField,
   needsCompanyResearch } from "./draft-provider.js";
 import { draftContextFingerprint, reusableApprovedAnswer } from "../src/approved-answers.js";
-import { fillAshbyRequiredControls, verifyAshbyRequiredControls } from "./ashby-adapter.js";
+import { ashbyValidationErrors, fillAshbyRequiredControls, repairAshbyRadioErrors,
+  verifyAshbyRequiredControls } from "./ashby-adapter.js";
 
 const FINAL_BUTTON = /submit(?: application)?|send application|complete application/i;
 const NEXT_BUTTON = /next|continue|save and continue|review/i;
@@ -13,10 +14,23 @@ const AUTH_BUTTON = /sign in|log in|create account|register|sign up/i;
 const SIGNUP_BUTTON = /create account|register|sign up/i;
 const SUCCESS_TEXT = /thank you|application (?:has been |was )?(?:successfully )?submitted|application received|received your application/i;
 const BLOCKED_SUBMISSION_TEXT = /we couldn't submit your application[\s\S]*flagged as possible spam/i;
-const CHALLENGE_TEXT = /captcha|verify you are human|security check|unusual traffic|cloudflare/i;
+const CHALLENGE_TEXT = /(?:complete|solve|enter|check|verify)(?:\s+the|\s+a)?\s+(?:re)?captcha|(?:re)?captcha (?:required|verification)|verify (?:that )?you are (?:a )?human|security check|unusual traffic|cloudflare (?:challenge|verification)/i;
+const MISSING_POSTING_BODY = /\b(?:Job not found\s*The job you requested was not found|Page not found\s*The page you requested was not found)\b/i;
 const VERIFICATION_FIELD = /\b(otp|one.?time|verification code|security code|authenticator|two.?factor|2fa|mfa|passkey)\b/i;
 const NARRATIVE_QUESTION = /\b(?:why|motivation|cover letter|describe|explain|project|challenge|achievement|accomplishment|story|what interests|tell us about)\b/i;
 const REUSABLE_FACT_QUESTION = /^(?:how did you hear about (?:this|the) (?:job|role)|referral source|current employer|current job title|notice period|start date|how many years of [a-z0-9 ]+ experience|[a-z ]+ language proficiency)$/;
+
+function savedAnnualSalary(field, profile) {
+  const label = normalize(field.label);
+  if (!/\b(?:expect|expected|expectations|desired)\b/.test(label)
+    || !/\b(?:annual|yearly|per year)\b/.test(label)
+    || !/\b(?:salary|compensation|pay)\b/.test(label)
+    || /\b(?:current|previous|past|usd|dollars|gbp|pounds)\b/.test(label)
+    || /[$£]/.test(field.label ?? "")) return undefined;
+  const value = profile.applicationAnswers?.annual_salary_expectation;
+  if (typeof value !== "string" || !value.trim() || /[\r\n]/.test(value)) return undefined;
+  return value.trim();
+}
 
 async function greenhouseEmailCodeChallenge(page, body) {
   let host;
@@ -50,6 +64,7 @@ export async function waitForSubmissionEvidence(page, previousUrl, bodyBeforeSub
     const newSuccessText = !successAlreadyPresent && SUCCESS_TEXT.test(body)
       && activeForm === 0 && body.length < 2000;
     if ((confirmationUrl || newSuccessText) && activeForm === 0 && invalidControls === 0) return true;
+    if (await ashbyValidationErrors(page).then((errors) => errors.length > 0).catch(() => false)) return false;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   return false;
@@ -148,6 +163,13 @@ function flattenProfile(profile, currentUrl) {
     if (key && values[key] === undefined) values[key] = answer;
   }
   const storedAnswers = profile.applicationAnswers ?? {};
+  // Workday can require both local-script and Latin-script legal-name parts.
+  // Use only spellings the owner has saved; never derive them from a generic
+  // first/last name or invent a patronymic.
+  values["bulgarian given name s"] = storedAnswers.workday_bulgarian_given_name;
+  values["bulgarian patronymic name"] = storedAnswers.workday_bulgarian_patronymic_name;
+  values["bulgarian family name"] = storedAnswers.workday_bulgarian_family_name;
+  values["patronymic name latin script"] = storedAnswers.workday_latin_patronymic_name;
   const residenceCountry = String(contact.country ?? "").trim();
   values["what would be your availability to join us"] = storedAnswers["What is your availability?"]
     ?? storedAnswers.Availability ?? storedAnswers.availability;
@@ -186,6 +208,7 @@ function flattenProfile(profile, currentUrl) {
 function resolveAnswer(field, answers, profileValues, preparedAnswers = {}, approvedAnswers = [], opportunity = {}, skills = [], profile = {}) {
   const candidates = [...new Set([field.name, field.id, field.label, field.groupQuestion]
     .filter(Boolean).flatMap((value) => [value, withoutRequiredMarker(value)]))];
+  const annualSalary = savedAnnualSalary(field, profile);
   if (field.type === "checkbox" && field.groupQuestion) {
     for (const candidate of [field.name, field.groupQuestion]) {
       const direct = Object.hasOwn(answers, candidate) ? answers[candidate] : answers[normalize(candidate)];
@@ -196,10 +219,15 @@ function resolveAnswer(field, answers, profileValues, preparedAnswers = {}, appr
     }
   }
   for (const candidate of candidates) {
-    if (Object.hasOwn(answers, candidate)) return { value: answers[candidate], source: "application answer" };
+    if (Object.hasOwn(answers, candidate)) return { value: answers[candidate],
+      source: annualSalary !== undefined && answers[candidate] === annualSalary
+        ? "verified profile fact" : "application answer" };
     const key = normalize(candidate);
-    if (Object.hasOwn(answers, key)) return { value: answers[key], source: "application answer" };
+    if (Object.hasOwn(answers, key)) return { value: answers[key],
+      source: annualSalary !== undefined && answers[key] === annualSalary
+        ? "verified profile fact" : "application answer" };
   }
+  if (annualSalary !== undefined) return { value: annualSalary, source: "verified profile fact" };
   for (const candidate of candidates) {
     const key = normalize(candidate);
     if (Object.hasOwn(preparedAnswers, candidate)) return { value: preparedAnswers[candidate], source: "drafted prose" };
@@ -883,6 +911,42 @@ export function unavailablePostingUrl(value) {
   } catch { return false; }
 }
 
+function checkpointField(field) {
+  const key = String(field.key ?? "").slice(0, 160);
+  const label = String(field.label ?? "").slice(0, 500);
+  const secret = field.type === "password"
+    || /password|passwd|passcode|one.?time|otp|verification code|security code|secret|token|api.?key|access.?key|session|cookie/i
+      .test(`${key} ${label}`);
+  return {
+    step: field.step, key, label, type: field.type,
+    required: field.required === true, status: field.status,
+    ...(field.source ? { source: String(field.source).slice(0, 160) } : {}),
+    ...(field.status === "filled" ? { value: secret ? "[redacted]"
+      : String(field.value ?? "").slice(0, 5000) } : {})
+  };
+}
+
+function checkpointFields(observedFields) {
+  const fields = [];
+  let size = 0;
+  let truncated = false;
+  for (const field of [...observedFields.values()].slice(0, 200)) {
+    const entry = checkpointField(field);
+    let encoded = JSON.stringify(entry);
+    if (size + encoded.length > 56_000 && Object.hasOwn(entry, "value")) {
+      entry.value = "[omitted: checkpoint size limit]";
+      entry.truncated = true;
+      encoded = JSON.stringify(entry);
+      truncated = true;
+    }
+    if (size + encoded.length > 60_000) { truncated = true; break; }
+    fields.push(entry);
+    size += encoded.length;
+  }
+  if (observedFields.size > 200) truncated = true;
+  return { fields, truncated };
+}
+
 export async function automateApplication({ page, profile, opportunity, application, artifactsDirectory,
   evidencePacket, draftProvider, claimReviewer, markFinalActionStarted, authorizeFinal, commitFinal }) {
   const attemptStarted = performance.now();
@@ -899,11 +963,14 @@ export async function automateApplication({ page, profile, opportunity, applicat
   // React-based ATS pages can finish DOMContentLoaded before the application
   // controls are mounted. Wait for a real control so the first inspection does
   // not incorrectly classify a supported form as empty.
-  await page.locator("input, textarea, select, button, iframe").first()
-    .waitFor({ state: "attached", timeout: 10_000 }).catch(() => undefined);
+  await page.waitForFunction((missingPostingPattern) =>
+    document.querySelector("input, textarea, select, button, iframe")
+      || new RegExp(missingPostingPattern, "i").test(document.body?.innerText ?? ""),
+  MISSING_POSTING_BODY.source, { timeout: 10_000 }).catch(() => undefined);
   const surfaceDeadline = Date.now() + 10_000;
   while (Date.now() < surfaceDeadline) {
     if (await findAction(page).catch(() => null)) break;
+    if (MISSING_POSTING_BODY.test(await page.locator("body").innerText().catch(() => ""))) break;
     await page.waitForTimeout(200);
   }
   await page.waitForTimeout(150);
@@ -920,14 +987,11 @@ export async function automateApplication({ page, profile, opportunity, applicat
     ...result, phase, preparedAnswers,
     metrics: { ...timings, activeMs: performance.now() - attemptStarted },
     checkpoint: {
-      version: 1, applicationId: application.id, step,
+      version: 1, applicationId: application.id, step, phase,
       origin: new URL(surface.url()).origin,
       steps: [...new Map([...observedFields.values()].map((field) => [field.step,
         { index: field.step, signature: field.stepSignature }])).values()],
-      fields: [...observedFields.values()].slice(0, 200).map((field) => ({
-        step: field.step, key: field.key, label: field.label,
-        status: field.status, source: field.source
-      }))
+      ...checkpointFields(observedFields)
     }
   });
   // Account creation plus a multi-page application can legitimately exceed
@@ -1164,7 +1228,7 @@ export async function automateApplication({ page, profile, opportunity, applicat
         message: "The application site presented a human verification challenge",
         requirements: [{ kind: "human_challenge", action: "manual_review",
           message: "Complete or inspect the browser challenge" }] }, step);
-      if (!inventory.length && /\bJob not found\b\s*The job you requested was not found\./i.test(body)) {
+      if (!inventory.length && MISSING_POSTING_BODY.test(body)) {
         return pause({ status: "posting_unavailable", reasonCode: "posting_not_found",
           message: "The employer application page says the job was not found" }, step);
       }
@@ -1205,6 +1269,12 @@ export async function automateApplication({ page, profile, opportunity, applicat
       if (validation.length) return pause({ status: "needs_input",
         message: "The application has field errors before final submission",
         requirements: validation }, step);
+      const ashbyErrors = await ashbyValidationErrors(surface, custom.fields);
+      if (ashbyErrors.length) return pause({ status: "needs_input",
+        message: "The employer form has field errors before final submission",
+        requirements: ashbyErrors.map(({ label, key }) => ({ kind: "missing_answer",
+          fields: [key], message: `${label}: the employer form needs this answer corrected`,
+          recommendation: "custom" })) }, step);
       const greenhouseResumeGroup = /^(?:job-boards|boards)(?:\.eu)?\.greenhouse\.io$/.test(
         new URL(surface.url()).hostname)
         && await surface.locator('.file-upload[role="group"][aria-labelledby="upload-label-resume"]').count();
@@ -1360,9 +1430,30 @@ export async function automateApplication({ page, profile, opportunity, applicat
       continue;
     }
     await surface.waitForLoadState("domcontentloaded", { timeout: 10_000 }).catch(() => undefined);
-    const verified = await waitForSubmissionEvidence(surface, previousUrl, bodyBeforeSubmit);
+    let verified = await waitForSubmissionEvidence(surface, previousUrl, bodyBeforeSubmit);
+    let validationErrors = verified ? [] : await ashbyValidationErrors(surface, custom.fields);
+    if (validationErrors.length && await repairAshbyRadioErrors(surface, validationErrors)) {
+      await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
+      // A visible field error proves the first click was rejected. Retry once
+      // only after the original answers have been restored and reverified.
+      if (!await ashbyValidationErrors(surface).then((errors) => errors.length)
+        && await verifyAshbyRequiredControls(surface, custom.fields)
+        && await finalLiveState(surface) === reviewedLiveState) {
+        const retryBody = (await surface.locator("body").innerText().catch(() => "")).slice(0, 50_000);
+        await action.locator.click({ noWaitAfter: true });
+        verified = await waitForSubmissionEvidence(surface, previousUrl, retryBody);
+      }
+      validationErrors = verified ? [] : await ashbyValidationErrors(surface, custom.fields);
+    }
     timings.receiptMs += performance.now() - transitionStarted;
     if (!verified) {
+      if (validationErrors.length) {
+        return pause({ status: "needs_input", validationRejected: true,
+          message: "The employer rejected these form fields",
+          requirements: validationErrors.map(({ label, key }) => ({ kind: "missing_answer",
+            fields: [key], message: `${label}: the employer form needs this answer reselected or corrected`,
+            recommendation: "custom" })) }, step);
+      }
       await Promise.allSettled(networkBodies);
       await mkdir(artifactsDirectory, { recursive: true, mode: 0o700 });
       await page.screenshot({ path: path.join(artifactsDirectory, `${application.id}.unverified.png`),

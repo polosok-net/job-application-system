@@ -103,6 +103,25 @@ test("worker pauses for an unknown required answer", async () => {
   assert.deepEqual(result.requirements[0].fields, ["kotlin_years"]);
 });
 
+test("Workday legal-name fields use the owner's saved script-specific spellings", async () => {
+  const result = await run(`<form>
+    <label>Bulgarian Given Name(s)<input name="firstNameLocal" required></label>
+    <label>Bulgarian Patronymic Name<input name="secondaryLocal" required></label>
+    <label>Bulgarian Family Name<input name="lastNameLocal" required></label>
+    <label>Patronymic Name - Latin Script<input name="secondaryLastName" required></label>
+    <button type="submit">Submit Application</button></form>`, {}, {
+    ...profile, applicationAnswers: {
+      workday_bulgarian_given_name: "Ада",
+      workday_bulgarian_patronymic_name: "Няма",
+      workday_bulgarian_family_name: "Лавлейс",
+      workday_latin_patronymic_name: "N/A"
+    }
+  }, { finalApprovalRequired: true });
+  assert.equal(result.requirements[0].kind, "final_submission_approval");
+  assert.deepEqual(result.requirements[0].preview.filled.map((field) => field.value),
+    ["Ада", "Няма", "Лавлейс", "N/A"]);
+});
+
 test("visual required markers cannot produce an empty final approval", async () => {
   const result = await run(`<form>
     <label>First name* <span class="sr-only">Required</span><input name="first_name"></label>
@@ -295,6 +314,22 @@ test("worker fills safe fields before pausing for an embedded challenge", async 
   assert.equal(result.requirements[0].kind, "human_challenge");
   assert.deepEqual(result.checkpoint.fields.map((field) => [field.key, field.status]),
     [["first_name", "filled"], ["email", "filled"]]);
+  assert.deepEqual(result.checkpoint.fields.map((field) => field.value),
+    ["Ada", "ada@example.test"]);
+  assert.equal(result.checkpoint.phase, "before_final_action");
+});
+
+test("challenge checkpoint keeps safe values and redacts credentials", async () => {
+  const result = await run(`<form>
+    <label>First name <input name="first_name" required></label>
+    <label>Password <input name="password" type="password" required></label>
+    <button type="submit">Submit Application</button>
+  </form><iframe src="data:text/html,recaptcha-challenge"></iframe>`,
+  { password: "private-value" });
+  assert.equal(result.requirements[0].kind, "human_challenge");
+  assert.equal(result.checkpoint.fields.find((field) => field.key === "first_name")?.value, "Ada");
+  assert.equal(result.checkpoint.fields.find((field) => field.key === "password")?.value, "[redacted]");
+  assert.doesNotMatch(JSON.stringify(result.checkpoint), /private-value/);
 });
 
 test("invisible reCAPTCHA badge does not block final review", async () => {
@@ -309,6 +344,15 @@ test("invisible reCAPTCHA badge does not block final review", async () => {
   });
   assert.equal(result.requirements[0].kind, "final_submission_approval");
   assert.equal(result.requirements[0].preview.filled[0].value, "Ada");
+});
+
+test("passive CAPTCHA notice does not hold an otherwise ready form", async () => {
+  const result = await run(`<form>
+    <label>First name <input name="first_name" required></label>
+    <button type="submit">Submit Application</button>
+  </form><p>This site is protected by reCAPTCHA.</p>`,
+  {}, profile, { finalApprovalRequired: true });
+  assert.equal(result.requirements[0].kind, "final_submission_approval");
 });
 
 test("Ashby custom required controls cannot be omitted from final approval", async () => {
@@ -360,6 +404,57 @@ test("Ashby custom answers are selected, verified, and shown in final preview", 
   assert.deepEqual(result.requirements[0].preview.filled
     .filter((field) => field.type === "ashby_custom").map((field) => [field.label, field.value]),
   [["Location", "Portugal"], ["Completed degree?", "Yes"], ["How did you hear about us?", "Job board"]]);
+});
+
+test("Ashby optional location combobox uses the verified profile and reaches final review", async () => {
+  const result = await run(`<form>
+    <div class="ashby-application-form-field-entry" data-field-path="location-id">
+      <label class="ashby-application-form-question-title">Location</label>
+      <input role="combobox" aria-expanded="false" oninput="this.setAttribute('aria-expanded','true');choices.hidden=false">
+      <div id="choices" role="listbox" hidden><div role="option"
+        onclick="document.querySelector('[role=combobox]').value='Lisbon, Portugal';document.querySelector('[role=combobox]').setAttribute('aria-expanded','false');choices.hidden=true">Lisbon, Portugal</div></div>
+    </div>
+    <button type="submit">Submit Application</button>
+  </form>`, {}, { ...profile,
+    contact: { ...profile.contact, city: "Lisbon", country: "Portugal", location: "Lisbon, Portugal" }
+  }, { finalApprovalRequired: true });
+  assert.equal(result.requirements[0].kind, "final_submission_approval");
+  assert.deepEqual(result.requirements[0].preview.filled
+    .filter((field) => field.type === "ashby_custom")
+    .map((field) => [field.label, field.value, field.required]),
+  [["Location", "Lisbon, Portugal", false]]);
+});
+
+test("optional interview motivation receives a reviewed role-specific draft", async () => {
+  const result = await run(`<form>
+    <label for="motivation">Tell us why we should interview you</label>
+    <textarea id="motivation" name="motivation"></textarea>
+    <button type="submit">Submit Application</button>
+  </form>`, {}, { ...profile, skills: ["React"] }, { finalApprovalRequired: true }, undefined, {
+    evidencePacket: { applicant: { skills: ["React"] }, listing: "This role builds React interfaces." },
+    draftProvider: { draft: async ({ questions }) => questions.map((question) => ({
+      fieldId: question.fieldId, text: "I build React interfaces and would welcome an interview.",
+      evidenceIds: ["applicant:skills"]
+    })) },
+    claimReviewer: { review: async () => ({ supported: true, responsive: true,
+      claims: [{ text: "I build React interfaces", supported: true,
+        evidenceIds: ["applicant:skills"] }] }) }
+  });
+  assert.equal(result.requirements[0].kind, "final_submission_approval", JSON.stringify(result.requirements[0]));
+  assert.equal(result.requirements[0].preview.filled
+    .find((field) => field.key === "motivation")?.source, "drafted prose",
+  JSON.stringify(result.requirements[0].preview));
+});
+
+test("optional interview motivation pauses for an answer when drafting is disabled", async () => {
+  const result = await run(`<form>
+    <label for="motivation">Tell us why we should interview you</label>
+    <textarea id="motivation" name="motivation"></textarea>
+    <button type="submit">Submit Application</button>
+  </form>`, {}, profile, { finalApprovalRequired: true });
+  assert.equal(result.status, "needs_input");
+  assert.equal(result.requirements[0].kind, "missing_answer");
+  assert.deepEqual(result.requirements[0].fields, ["motivation"]);
 });
 
 test("Ashby location and verified work facts reuse the saved profile", async () => {
@@ -419,6 +514,14 @@ test("Ashby contract location can fall back from a city to its country", async (
 test("an explicit missing employer posting stops without a form review", async () => {
   const result = await run(`<main><h1>Job not found</h1><p>The job you requested was not found.</p>
     <button>Cookie Management</button></main>`);
+  assert.equal(result.status, "posting_unavailable");
+  assert.equal(result.reasonCode, "posting_not_found");
+  assert.equal(result.checkpoint.fields.length, 0);
+});
+
+test("an Ashby missing application page is classified as unavailable", async () => {
+  const result = await run(`<main><h1>Page not found</h1>
+    <p>The page you requested was not found</p></main>`);
   assert.equal(result.status, "posting_unavailable");
   assert.equal(result.reasonCode, "posting_not_found");
   assert.equal(result.checkpoint.fields.length, 0);
@@ -506,6 +609,28 @@ test("verified Portugal work facts and common availability variants are reused",
     ["Can start now.", "Yes", "No", "https://www.linkedin.com/in/example/"]);
 });
 
+test("the saved annual salary is reused only for matching expectation fields and values", async () => {
+  const annualForm = `<form>
+    <label>What are your annual salary expectations for this role?
+      <input name="question_11352296007" required></label>
+    <button type="submit">Submit Application</button></form>`;
+  const salaryProfile = { ...profile, applicationAnswers: {
+    annual_salary_expectation: "EUR 70,000 gross per year"
+  } };
+  for (const answers of [{}, { question_11352296007: "EUR 70,000 gross per year" }]) {
+    const result = await run(annualForm, answers, salaryProfile, { finalApprovalRequired: true });
+    assert.equal(result.requirements[0].kind, "final_submission_approval");
+    assert.equal(result.requirements[0].preview.filled[0].value, "EUR 70,000 gross per year");
+    assert.equal(result.requirements[0].preview.filled[0].source, "verified profile fact");
+  }
+  const changed = await run(annualForm, { question_11352296007: "EUR 90,000 gross per year" },
+    salaryProfile, { finalApprovalRequired: true });
+  assert.equal(changed.requirements[0].preview.filled[0].source, "application answer");
+  const current = await run(annualForm.replace("annual salary expectations", "current annual salary"),
+    {}, salaryProfile, { finalApprovalRequired: true });
+  assert.equal(current.requirements[0].kind, "missing_answer");
+});
+
 test("work authorization is not copied across residence countries", async () => {
   const result = await run(`<form>
     <label>Are you authorized to work in Portugal? <input name="authorized" required></label>
@@ -579,6 +704,40 @@ test("Ashby submit waits for the last field save triggered by blur", async () =>
       opportunity: { applyUrl: "https://jobs.ashbyhq.com/test/application" },
       application: { id: "application-one", answers: {} }, artifactsDirectory });
     assert.equal(result.status, "submitted");
+  } finally { await context.close(); }
+});
+
+test("Ashby red radio errors are repaired and the retry obtains a receipt", async () => {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const artifactsDirectory = await mkdtemp(path.join(os.tmpdir(), "job-worker-test-"));
+  await page.route("https://jobs.ashbyhq.com/test/application", (route) => route.fulfill({
+    contentType: "text/html", body: `<fieldset class="ashby-application-form-input-radio-group">
+      <label class="ashby-application-form-question-title _required_a1" for="gender">Gender</label>
+      <label for="male"><input id="male" type="radio" name="gender" onclick="choose('Male')">Male</label>
+      <label for="other"><input id="other" type="radio" name="gender" onclick="choose('Prefer not to say')">Prefer not to say</label>
+    </fieldset><button id="submit" onclick="submitApplication()">Submit Application</button>
+    <script>
+      let changes = 0; let stored = ''; let clicks = 0;
+      function choose(value) {
+        changes++; if (changes > 1) stored = value;
+        if (stored === 'Male') document.querySelector('[role=alert]')?.remove();
+      }
+      function submitApplication() {
+        clicks++;
+        if (stored !== 'Male') {
+          if (!document.querySelector('[role=alert]')) document.body.insertAdjacentHTML('beforeend',
+            '<div role="alert">Your form needs corrections<button>Missing entry for required field: Gender</button></div>');
+        } else document.body.innerHTML = '<h2>Success</h2><p>Your application was successfully submitted.</p>';
+      }
+    </script>`
+  }));
+  try {
+    const result = await automateApplication({ page, profile,
+      opportunity: { applyUrl: "https://jobs.ashbyhq.com/test/application" },
+      application: { id: "application-one", answers: { gender: "Male" } }, artifactsDirectory });
+    assert.equal(result.status, "submitted", JSON.stringify({ result, body: await page.locator("body").innerText() }));
+    assert.equal(await page.evaluate(() => clicks), 2);
   } finally { await context.close(); }
 });
 

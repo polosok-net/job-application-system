@@ -23,7 +23,10 @@ const token = process.env.JOB_SERVER_TOKEN
 const routes = {
   health: ["GET", "/health"], me: ["GET", "/v1/me"], opportunities: ["GET", "/v1/opportunities"],
   profile: ["GET", "/v1/profile/status"], "profile-update": ["PATCH", "/v1/profile"],
+  "fit-context": ["GET", `/v1/profile/fit-context${id ? `?mode=${encodeURIComponent(id)}` : ""}`],
   scan: ["POST", "/v1/discovery/scan"],
+  consider: ["POST", "/v1/discovery/consider"],
+  filter: ["POST", "/v1/discovery/filter"],
   sources: ["GET", "/v1/discovery/sources"], query: ["POST", "/v1/discovery/query"],
   "campaign-start": ["POST", "/v1/campaigns"], "campaigns": ["GET", "/v1/campaigns"],
   "campaign-status": ["GET", `/v1/campaigns/${id}`],
@@ -42,8 +45,8 @@ const routes = {
   "record-employer-status": ["POST", `/v1/applications/${id}/employer-status`],
   confirm: ["POST", `/v1/confirmations/${id}`], reject: ["POST", `/v1/confirmations/${id}`]
 };
-if ((!routes[command] && command !== "callback") || (["apply", "campaign-status", "campaign-report", "campaign-approve", "campaign-add-source", "research", "refresh-preview", "record-submission", "record-employer-status", "confirm", "reject", "callback"].includes(command) && !id)) {
-  console.error("usage: jobctl <health|me|profile|profile-update|sources|scan|query|campaign-start|campaigns|campaign-status ID|campaign-report ID|campaign-approve ID|campaign-add-source ID|direct|opportunities|applications|application-log|application-metrics|inbox|approve-batch|research ID|refresh-preview ID|add|apply ID|record-submission ID|record-employer-status ID|confirm ID|reject ID|callback DATA>");
+if ((!routes[command] && !["callback", "backlog", "handoff"].includes(command)) || (["apply", "campaign-status", "campaign-report", "campaign-approve", "campaign-add-source", "research", "refresh-preview", "record-submission", "record-employer-status", "confirm", "reject", "callback", "handoff"].includes(command) && !id)) {
+  console.error("usage: jobctl <health|me|profile|fit-context|profile-update|sources|scan|filter|consider|query|campaign-start|campaigns|campaign-status ID|campaign-report ID|campaign-approve ID|campaign-add-source ID|direct|opportunities|applications|application-log|backlog|handoff ID|application-metrics|inbox|approve-batch|research ID|refresh-preview ID|add|apply ID|record-submission ID|record-employer-status ID|confirm ID|reject ID|callback DATA>");
   process.exit(2);
 }
 
@@ -72,6 +75,28 @@ async function request(method, pathname, body) {
     process.exit(1);
   }
   return text ? JSON.parse(text) : {};
+}
+
+if (command === "backlog" || command === "handoff") {
+  const log = await request("GET", "/v1/application-log");
+  const pending = log.items.filter((item) => ["waiting_confirmation", "waiting_research"].includes(item.status))
+    .sort((left, right) => String(left.updatedAt).localeCompare(String(right.updatedAt)));
+  const needsOutcomeCheck = (item) => item.pause?.phase === "final_action_started"
+    || item.pendingReview?.some((review) => /submission_unverified|submission_recovery|submission_email_verification|submission_blocked/.test(review.kind));
+  if (command === "backlog") {
+    process.stdout.write(`${JSON.stringify({ total: pending.length,
+      items: pending.map((item) => ({ applicationId: item.applicationId,
+        company: item.company, title: item.title, status: item.status, updatedAt: item.updatedAt,
+        reviewKinds: item.pendingReview?.map((review) => review.kind) ?? [],
+        savedFieldCount: item.pausedFields?.filter((field) => field.status === "filled").length ?? 0,
+        requiresOutcomeCheck: Boolean(needsOutcomeCheck(item)) })) })}\n`);
+    process.exit(0);
+  }
+  const item = pending.find((entry) => entry.applicationId === id);
+  if (!item) throw new Error("application is not in this profile's review backlog");
+  process.stdout.write(`${JSON.stringify({ ...item,
+    requiresOutcomeCheck: Boolean(needsOutcomeCheck(item)) })}\n`);
+  process.exit(0);
 }
 
 if (command === "callback") {
