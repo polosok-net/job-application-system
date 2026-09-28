@@ -5,6 +5,7 @@ import { NeedsInputError, NeedsReviewError, NeedsResearchError, PostingUnavailab
 import { telemetry as defaultTelemetry } from "./telemetry.js";
 import { relatedApplicationRole, roleKeys } from "./discovery/handled-roles.js";
 import { scoreOpportunity } from "./discovery/scoring.js";
+import { acceptedFit, fitPassesGate, reviewedEligibility } from "./discovery/fit-assessment.js";
 import { automaticSubmissionUnsupported, officialAtsDestination, revalidateOfficialAtsRole,
   revalidateWorkableRole, revalidateWorkdayRole } from "./discovery/official-ats.js";
 import { summarizeSourceHealth } from "./discovery/source-health.js";
@@ -117,13 +118,14 @@ export class ApplicationService {
   }
 
   async addOpportunity(input, identity, { serverVerifiedDiscovery = false,
-    advisoryDiscovery = null } = {}) {
+    reviewedDiscovery = false, advisoryDiscovery = null } = {}) {
     if (!input.title || !input.company || !input.applyUrl) {
       throw new ClientError(400, "title, company, and applyUrl are required");
     }
     // Client-supplied score/source/provenance is useful for review but cannot
     // establish authorization for an automatic final action.
     const candidate = { ...input };
+    if (!reviewedDiscovery) delete candidate.fitAssessment;
     for (const field of ["discoveryVerification", "discoveryState", "destinationFirstObservedAt",
       "discoveryRelease",
       "destinationRetryAfter", "destinationExpiresAt", "destinationRetryCount",
@@ -217,6 +219,17 @@ export class ApplicationService {
           audit(state, identity, "opportunity.direct_intent_recorded", existing.id, {
             priorSource: existing.source, normalizedUrl: applicationUrl
           });
+        }
+        if (reviewedDiscovery && candidate.fitAssessment && !priorApplications.length) {
+          if (serverVerifiedDiscovery && sameOfficialRole
+            && candidate.applicationDestinationVerified === true
+            && candidate.applicationDestinationPending !== true) {
+            Object.assign(existing, candidate, { discoveryState: "ready",
+              discoveryVerification: { sourceId: candidate.source ?? "agent",
+                verifiedAt: now(), score: Number(candidate.score ?? 0) } });
+          }
+          existing.fitAssessment = candidate.fitAssessment;
+          existing.updatedAt = now();
         }
         return existing;
       }
@@ -347,16 +360,23 @@ export class ApplicationService {
       }
 
       const decision = evaluatePolicy({ opportunity, mode, modeConfig, answers: input.answers });
+      if (acceptedFit(opportunity)) {
+        const mismatches = reviewedEligibility(opportunity, profile, mode);
+        decision.reasons.push(...mismatches);
+        if (mismatches.length) decision.eligible = false;
+      }
       let specialistFitReview = false;
       if (covered) {
         const freshScore = scoreOpportunity(opportunity, profile, mode,
           { version: String(this.config.discovery?.scorerVersion ?? "2") });
-        if (freshScore.scoreDetails.hardExclusion || freshScore.score < modeConfig.minimumScore) {
+        if (!fitPassesGate(opportunity, freshScore, modeConfig.minimumScore, profile, mode)) {
           decision.eligible = false;
-          decision.reasons.push(freshScore.scoreDetails.hardExclusion ?? "current fit score below minimum");
+          if (!acceptedFit(opportunity)) {
+            decision.reasons.push(freshScore.scoreDetails.hardExclusion ?? "current fit score below minimum");
+          }
         }
         decision.autoApply = true;
-        specialistFitReview = Boolean(freshScore.scoreDetails.fitReview);
+        specialistFitReview = !acceptedFit(opportunity) && Boolean(freshScore.scoreDetails.fitReview);
         if (specialistFitReview) {
           decision.autoApply = false;
           const review = freshScore.scoreDetails.fitReview;
@@ -485,11 +505,12 @@ export class ApplicationService {
       if (profile && opportunity) {
         const freshScore = scoreOpportunity(opportunity, profile, current.mode,
           { version: String(this.config.discovery?.scorerVersion ?? "2") });
-        if (freshScore.scoreDetails.hardExclusion
-          || freshScore.score < this.config.modes[current.mode].minimumScore) {
+        if (!fitPassesGate(opportunity, freshScore,
+          this.config.modes[current.mode].minimumScore, profile, current.mode)) {
           reasonCodes.push("current_fit_not_eligible");
         }
-        if (freshScore.scoreDetails.fitReview && !current.finalApprovalRequired) {
+        if (!acceptedFit(opportunity) && freshScore.scoreDetails.fitReview
+          && !current.finalApprovalRequired) {
           reasonCodes.push(freshScore.scoreDetails.fitReview.reason === "unverified_employer_identity"
             ? "employer_identity_review_required" : "specialist_fit_review_required");
         }
@@ -601,7 +622,8 @@ export class ApplicationService {
         && recentEmployerReceipts(state, current.profileId, opportunity.company) >= 2) {
         throw new ClientError(409, "recent employer submissions require a fresh review");
       }
-      if (!current.finalApprovalRequired && profile && scoreOpportunity(opportunity, profile, current.mode,
+      if (!current.finalApprovalRequired && !acceptedFit(opportunity) && profile
+        && scoreOpportunity(opportunity, profile, current.mode,
         { version: String(this.config.discovery?.scorerVersion ?? "2") }).scoreDetails.fitReview) {
         throw new ClientError(409, "specialist experience requires a fresh review");
       }
@@ -621,6 +643,11 @@ export class ApplicationService {
       (item) => item.id === confirmationId && item.profileId === identity.profileId
     );
     if (!target) throw new ClientError(404, "confirmation not found");
+    const existingApplication = this.store.snapshot().applications.find((item) =>
+      item.id === target.applicationId && item.profileId === identity.profileId);
+    if (existingApplication?.status === "submitted" && existingApplication.receipt?.finalUrl) {
+      throw new ClientError(409, "application is already submitted; do not retry its confirmation");
+    }
     const approvalProfile = target.kind === "final_submission_approval" && input.approved === true
       ? await this.profiles?.get(identity.profileId) : null;
     let requireApprovalOnRetry = false;
@@ -685,12 +712,21 @@ export class ApplicationService {
         delete safeAnswers[controlField];
       }
     }
+    const manualReceipt = target.action === "manual_review" && input.approved === true
+      && input.answers?.submitted === true && input.answers?.finalUrl
+      ? { submittedAt: now(), finalUrl: validateDirectUrl(input.answers.finalUrl),
+        ...(input.answers.externalId !== undefined ? { externalId: input.answers.externalId } : {}),
+        manuallyVerified: true } : null;
     const result = await this.store.mutate(async (state) => {
       const confirmation = state.confirmations.find(
         (item) => item.id === confirmationId && item.profileId === identity.profileId
       );
       if (!confirmation) throw new ClientError(404, "confirmation not found");
       if (confirmation.status !== "pending") throw new ClientError(409, "confirmation is already resolved");
+      const application = state.applications.find((item) => item.id === confirmation.applicationId);
+      if (application.status === "submitted" && application.receipt?.finalUrl) {
+        throw new ClientError(409, "application is already submitted; do not retry its confirmation");
+      }
       const hasManualFieldAnswers = confirmation.action === "manual_review"
         && Array.isArray(confirmation.fields) && confirmation.fields.length > 0
         && confirmation.fields.every((field) => Object.hasOwn(safeAnswers, field)
@@ -707,8 +743,7 @@ export class ApplicationService {
       confirmation.resolvedAt = now();
       confirmation.response = safeAnswers;
       confirmation.resolvedBy = identity.actorId;
-      const application = state.applications.find((item) => item.id === confirmation.applicationId);
-      if (input.approved !== true) {
+      if (input.approved !== true || manualReceipt) {
         for (const sibling of state.confirmations) {
           if (sibling.applicationId === application.id && sibling.id !== confirmation.id
             && sibling.status === "pending") {
@@ -734,18 +769,13 @@ export class ApplicationService {
       } else if (safeAnswers) Object.assign(application.answers, safeAnswers);
       const related = state.confirmations.filter((item) => item.applicationId === application.id
         && item.status !== "superseded");
-      if (related.some((item) => item.status === "rejected")) application.status = "rejected";
+      if (manualReceipt) {
+        application.status = "submitted";
+        application.receipt = manualReceipt;
+      } else if (related.some((item) => item.status === "rejected")) application.status = "rejected";
       else if (related.every((item) => item.status === "approved")) {
-        if (related.some((item) => item.action === "manual_review") && safeAnswers?.submitted === true) {
-          application.status = "submitted";
-          application.receipt = {
-            submittedAt: now(), finalUrl: safeAnswers.finalUrl,
-            externalId: safeAnswers.externalId, manuallyVerified: true
-          };
-        } else {
-          application.status = "queued";
-          application.queuedAt = now();
-        }
+        application.status = "queued";
+        application.queuedAt = now();
       }
       application.updatedAt = now();
       audit(state, identity, "confirmation.resolved", confirmation.id, { status: confirmation.status });
@@ -753,6 +783,10 @@ export class ApplicationService {
         campaignId: application.campaignId, applicationId: application.id,
         outcome: confirmation.status,
         durationMs: Math.max(0, Date.parse(confirmation.resolvedAt) - Date.parse(confirmation.createdAt))
+      });
+      if (manualReceipt) recordWorkflowStage(state, identity, application.id, "receipt", {
+        campaignId: application.campaignId, applicationId: application.id,
+        outcome: "manually_verified"
       });
       if (application.status === "rejected") recordWorkflowStage(state, identity, application.id,
         "terminal_failure", { campaignId: application.campaignId, applicationId: application.id,
@@ -1145,6 +1179,13 @@ export class ApplicationService {
         ...(input.externalId !== undefined ? { externalId: input.externalId } : {}),
         manuallyVerified: true
       };
+      for (const confirmation of state.confirmations) {
+        if (confirmation.applicationId === application.id && confirmation.status === "pending") {
+          confirmation.status = "superseded";
+          confirmation.resolvedAt = now();
+          confirmation.resolvedBy = identity.actorId;
+        }
+      }
       if (questionsAndAnswers.length) {
         application.recordedQuestionAnswers = questionsAndAnswers.map((item) => ({
           ...item,
@@ -1702,7 +1743,23 @@ function validatedCheckpoint(checkpoint, applicationId) {
     || JSON.stringify(checkpoint).length > 64_000) {
     return undefined;
   }
-  return checkpoint;
+  return { version: 1, applicationId, step: checkpoint.step,
+    phase: checkpoint.phase === "final_action_started" ? "final_action_started" : "before_final_action",
+    origin: String(checkpoint.origin ?? "").slice(0, 500),
+    steps: checkpoint.steps.slice(0, 16), truncated: checkpoint.truncated === true,
+    fields: checkpoint.fields.map((field) => {
+    const key = String(field?.key ?? "").slice(0, 160);
+    const label = String(field?.label ?? "").slice(0, 500);
+    const secret = field?.type === "password" || sensitiveFormField(key, label);
+    return { step: field?.step, key, label,
+      type: String(field?.type ?? "").slice(0, 80), required: field?.required === true,
+      status: field?.status === "filled" ? "filled" : "unfilled",
+      ...(field?.source ? { source: String(field.source).slice(0, 160) } : {}),
+      ...(field?.truncated === true ? { truncated: true } : {}),
+      ...(Object.hasOwn(field ?? {}, "value") ? {
+        value: secret ? "[redacted]" : String(field.value ?? "").slice(0, 5000)
+      } : {}) };
+  }) };
 }
 
 function validatedPreparedAnswers(value, previous = {}) {
@@ -1804,6 +1861,10 @@ function campaignStart(state, campaignId, profileId) {
 const CONTROL_ANSWER_KEYS = new Set(["retry", "submitted", "finalUrl", "externalId"]);
 const SENSITIVE_KEY = /(?:^|[_-])(?:password|passwd|passcode|secret|token|api[_-]?key|otp|cookie|session)(?:$|[_-])/i;
 const CREDENTIAL_INPUT_KEY = /(?:^|[_-])(?:password|passwd|passcode|secret|token|api[_-]?key|otp|cookie)(?:$|[_-])/i;
+function sensitiveFormField(key, label) {
+  return /password|passwd|passcode|one.?time|otp|verification code|security code|secret|token|api.?key|access.?key|session|cookie/i
+    .test(`${key} ${label}`);
+}
 
 function assertNoSensitiveAnswerFields(value, label, path = "") {
   if (!value || typeof value !== "object") return;
@@ -1849,6 +1910,8 @@ function buildApplicationLogEntry(application, opportunity = {}, confirmations =
   const finalPreview = confirmations
     .filter((item) => item.kind === "final_submission_approval" && item.preview)
     .at(-1)?.preview;
+  const paused = ["waiting_confirmation", "waiting_research"].includes(application.status);
+  const checkpoint = paused ? application.checkpoint : undefined;
   return {
     applicationId: application.id,
     opportunityId: application.opportunityId,
@@ -1865,6 +1928,23 @@ function buildApplicationLogEntry(application, opportunity = {}, confirmations =
     updatedAt: application.updatedAt,
     submittedAt: application.receipt?.submittedAt,
     questionsAndAnswers: [...answered.values()],
+    ...(paused ? {
+      pause: checkpoint ? { step: checkpoint.step, origin: checkpoint.origin,
+        phase: checkpoint.phase ?? "before_final_action", truncated: checkpoint.truncated === true } : null,
+      ...(application.status === "waiting_research" ? {
+        researchQuestions: application.researchQuestions ?? [] } : {}),
+      pausedFields: (checkpoint?.fields ?? []).map((field) => ({
+        step: field.step, key: field.key, label: field.label,
+        type: field.type, required: field.required, status: field.status,
+        source: field.source,
+        ...(Object.hasOwn(field, "value") ? { value: (sensitiveFormField(field.key, field.label)
+          || field.type === "password") ? "[redacted]" : sanitizeLoggedValue(field.key, field.value) } : {}),
+        ...(field.truncated === true ? { truncated: true } : {})
+      })),
+      pendingReview: confirmations.filter((item) => item.status === "pending")
+        .map((item) => ({ id: item.id, kind: item.kind, message: item.message,
+          fields: item.fields ?? [] }))
+    } : {}),
     submittedFields: (finalPreview?.filled ?? []).map((field) => ({
       label: field.label,
       value: sanitizeLoggedValue(field.label, field.value),
