@@ -1,13 +1,14 @@
 import { workableDestination, workableIdentity, workableKeyFromUrl } from './workable-identity.js';
+import { workdayDestination, workdayIdentity, workdayKeyFromUrl } from './workday-identity.js';
 
 // A role may enter the system through a board feed, a direct application URL,
 // or an indexed listing. Match stable ATS IDs before falling back to URLs.
 // Company and title are useful review hints, but are not role identities.
 const TRACKING_PARAMETER = /^(utm_|ref$|refid$|trackingid$|source$|gh_src$|lever-source$)/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// Stable employer ATS role identities. Workable is included for identity only;
-// automatic submission eligibility is decided separately in official-ats.js.
-export const STABLE_ROLE_KEY = /^(ashby|greenhouse|lever|workable):/;
+// Stable employer ATS role identities. Workable and Workday are included for
+// identity only; automatic submission eligibility is decided in official-ats.js.
+export const STABLE_ROLE_KEY = /^(ashby|greenhouse|lever|workable|workday):/;
 
 function identityText(value) {
   return String(value ?? '').toLowerCase().replace(/&amp;/g, ' and ')
@@ -38,6 +39,8 @@ function keyFromUrl(raw) {
   }
   const workable = workableKeyFromUrl(url);
   if (workable) return workable;
+  const workday = workdayKeyFromUrl(url);
+  if (workday) return workday;
   url.hash = '';
   for (const name of [...url.searchParams.keys()]) {
     if (TRACKING_PARAMETER.test(name)) url.searchParams.delete(name);
@@ -64,6 +67,8 @@ export function roleKeys(role) {
   }
   const workable = workableIdentity(role);
   if (workable) keys.add(workable.key);
+  const workday = workdayIdentity(role);
+  if (workday) keys.add(workday.key);
   for (const raw of [role?.applyUrl, role?.listingUrl, role?.url]) {
     const key = keyFromUrl(raw);
     if (key) keys.add(key);
@@ -138,7 +143,8 @@ export function knownRoleIndex(state, profileId) {
     // An unresolved board listing is observed, not handled. Revisit it so a
     // later scan can resolve its employer destination or update its evidence.
     if ((opportunity.applicationDestinationPending === true
-      || (opportunity.applicationDestinationVerified !== true && !workableDestination(opportunity)))
+      || (opportunity.applicationDestinationVerified !== true && !workableDestination(opportunity)
+        && !workdayDestination(opportunity)))
       && !applications.length) continue;
     // A confirmed unavailable posting may reopen later. Its skipped attempt
     // carried no final action, so a fresh employer check is safe; receipts and

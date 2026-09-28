@@ -15,7 +15,8 @@
       "ashby": { "boards": [] },
       "greenhouse": { "boards": [] },
       "lever": { "sites": [] },
-      "workable": { "boards": [] }
+      "workable": { "boards": [] },
+      "workday": { "sites": [] }
     }
   },
   "modes": {

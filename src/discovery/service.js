@@ -14,6 +14,7 @@ import { credentialFingerprint, isKeyedSource, missingCredentialMessage, redactS
   sourceCredentials } from "./source-credentials.js";
 import { PACED_WINDOWS, quotaError, quotaLimits, SourceQuota } from "./source-quota.js";
 import { workable } from "./sources/workable.js";
+import { workday } from "./sources/workday.js";
 import { scoreOpportunity } from "./scoring.js";
 import { telemetry } from "../telemetry.js";
 import { normalizeOpportunity } from "./normalization.js";
@@ -25,14 +26,14 @@ import { selectFitReviewCandidates } from "./fit-review-selection.js";
 import { legacyDiscoveryTitleRelevant } from "./title-preferences.js";
 import { ATS_SUBMISSION_UNSUPPORTED, automaticSubmissionUnsupported, employerAtsDestination,
   fetchVerifiedOfficialAtsRole, officialAtsDestination, officialAtsIdentityFromUrl } from "./official-ats.js";
-import { sourceConfigWithLearnedBoards, isLearnedBoardRequest,
+import { configuredBoardKey, sourceConfigWithLearnedBoards, isLearnedBoardRequest,
   learnedBoardRequestsInLastDay, MAX_LEARNED_BOARD_REQUESTS_PER_DAY } from "./learned-boards.js";
 
 const SOURCES = new Map([remoteok, arbeitnow, jobicy, himalayas, greenhouse, ashby, lever, adzuna, jobspipe,
-  workable].map((source) => [source.id, source]));
+  workable, workday].map((source) => [source.id, source]));
 const atsBoardKey = (parsed) => parsed ? `${parsed.source}:${parsed.board}` : null;
 const AGGREGATOR_SOURCES = new Set(["himalayas", "jobicy"]);
-const STAGED_ATS_SOURCES = new Set(["ashby", "greenhouse", "lever", "workable"]);
+const STAGED_ATS_SOURCES = new Set(["ashby", "greenhouse", "lever", "workable", "workday"]);
 const discoverySourceOf = (role) => role.discoverySource ?? role.source;
 const exactRoleText = (value) => String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 
@@ -135,6 +136,9 @@ export class DiscoveryService {
         maxResultsPerPage: jobspipeSettings(this.config.discovery?.sourceOptions?.jobspipe).pageSize,
         applicationFlow: "verify_official_ats_before_prepare" },
       workable: { kind: "official_feed", filters: { board: "configured", title: "local", location: "local" },
+        automaticSubmission: "unsupported" },
+      // Workday matches `title` on the server; the adapter still filters titles locally.
+      workday: { kind: "official_feed", filters: { board: "configured", title: "provider", location: "local" },
         automaticSubmission: "unsupported" }
     };
     const sourceOptions = this.config.discovery?.sourceOptions ?? {};
@@ -152,7 +156,8 @@ export class DiscoveryService {
           { cycle: sourceCycles[id] ?? 0,
             includeLearned: this.config.discovery?.broadenedSources?.[id] === true,
             isBackedOff: (key) => backedOff.has(key), isAtRequestBudget: atBudget });
-        return (options.boards ?? options.sites ?? []).map((item) => item.slug ?? item.token);
+        return (options.boards ?? options.sites ?? []).map((item) => configuredBoardKey(id, item))
+          .filter(Boolean);
       })(),
       ...(["himalayas", "jobicy", "remoteok", "arbeitnow", "adzuna"].includes(id)
         ? { applicationFlow: "resolve_employer_url_before_prepare" } : {}),
@@ -920,10 +925,12 @@ export class DiscoveryService {
       catch (error) { fetchCache.delete(key); throw error; }
     };
     const pacedOfficialFetch = (url, options, sourceId) => {
-      const key = String(url);
+      // Keyed like the response cache, so a POST search never shares another
+      // search's pending or cached response.
+      const key = cacheKey(url, options);
       if (fetchCache.has(key)) return cachedFetch(url, options, sourceId);
       if (pacedPendingByUrl.has(key)) return pacedPendingByUrl.get(key).then((response) => response.clone());
-      const origin = new URL(key).origin;
+      const origin = new URL(String(url)).origin;
       const previous = pacedOriginQueues.get(origin) ?? Promise.resolve();
       const pending = previous.catch(() => {}).then(async () => {
         if (blockedOfficialOrigins.has(origin)) {
@@ -974,6 +981,9 @@ export class DiscoveryService {
         previous.queryStats.push(...(stats.queryStats ?? []));
         previous.skippedTerms.push(...(stats.skippedTerms ?? []));
         previous.coverageBlocked ||= stats.coverageBlocked === true;
+        for (const key of ["detailReads", "unrecognizedRemoteType"]) {
+          if (stats[key] !== undefined) previous[key] = (previous[key] ?? 0) + Number(stats[key] ?? 0);
+        }
         providerStats.set(source.id, previous);
       }
       }); } finally {
@@ -1013,6 +1023,9 @@ export class DiscoveryService {
       row.queryStats = stats?.queryStats ?? [];
       row.skippedTerms = stats?.skippedTerms ?? [];
       row.coverageBlocked = stats?.coverageBlocked ?? false;
+      for (const key of ["detailReads", "unrecognizedRemoteType"]) {
+        if (stats?.[key] !== undefined) row[key] = stats[key];
+      }
       row.partialReasons = [...new Set(sourceErrors.map((error) => error.reason)
         .filter((reason) => /^partial_|^invalid_next_page$/.test(reason)))];
       row.errors = sourceErrors.map((error) => ({ reason: error.reason ?? "fetch_error" }));
@@ -1305,7 +1318,7 @@ export class DiscoveryService {
       // This flag is derived from a server-fetched official ATS row and its
       // stable role URL, never from caller-supplied source metadata.
       scored.applicationDestinationVerified = officialAtsDestination(scored);
-      // A Workable role read from its own account names the employer's ATS,
+      // A Workable or Workday role read from its own feed names the employer's ATS,
       // but stays unverified so no automatic lane can submit it.
       if (!employerAtsDestination(scored)) scored.applicationDestinationPending = true;
       if (isHandled(scored)) {

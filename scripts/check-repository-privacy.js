@@ -285,7 +285,8 @@ const expectedPublicCatalog = {
       ["ashby", "Ashby", "https://jobs.ashbyhq.com/"],
       ["greenhouse", "Greenhouse", "https://job-boards.greenhouse.io/"],
       ["lever", "Lever", "https://jobs.lever.co/"],
-      ["workable", "Workable", "https://apply.workable.com/"]
+      ["workable", "Workable", "https://apply.workable.com/"],
+      ["workday", "Workday", "https://www.workday.com/"]
     ].map(([id, name, url]) => ({ id, name, url })),
     visibleBrowserSources: [
       ["jobgether", "Jobgether", "https://jobgether.com/"],

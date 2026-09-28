@@ -6,7 +6,7 @@ import { telemetry as defaultTelemetry } from "./telemetry.js";
 import { relatedApplicationRole, roleKeys } from "./discovery/handled-roles.js";
 import { scoreOpportunity } from "./discovery/scoring.js";
 import { automaticSubmissionUnsupported, officialAtsDestination, revalidateOfficialAtsRole,
-  revalidateWorkableRole } from "./discovery/official-ats.js";
+  revalidateWorkableRole, revalidateWorkdayRole } from "./discovery/official-ats.js";
 import { summarizeSourceHealth } from "./discovery/source-health.js";
 import { sourceCooldowns } from "./discovery/source-cooldown.js";
 import { buildWorkflowReport, recordWorkflowStage } from "./workflow-report.js";
@@ -292,15 +292,18 @@ export class ApplicationService {
     const mode = input.mode ?? initialOpportunity.mode ?? this.config.defaultMode;
     const modeConfig = this.config.modes[mode];
     if (!modeConfig) throw new ClientError(400, `unknown mode: ${mode}`);
-    // No Workable submission adapter exists, so these roles only reach the
-    // manual lane. Confirm the posting is still open before admitting one.
-    if (automaticSubmissionUnsupported(initialOpportunity)) {
-      const live = await revalidateWorkableRole(initialOpportunity, this.fetchImpl);
+    // No Workable or Workday submission adapter exists, so these roles only
+    // reach the manual lane. Confirm the posting is still open before admitting one.
+    const workday = initialOpportunity.source === "workday";
+    if (workday || automaticSubmissionUnsupported(initialOpportunity)) {
+      const [provider, live] = workday
+        ? ["Workday", await revalidateWorkdayRole(initialOpportunity, this.fetchImpl)]
+        : ["Workable", await revalidateWorkableRole(initialOpportunity, this.fetchImpl)];
       if (live === "closed_or_changed") {
-        throw new ClientError(409, "role_closed_or_changed: the Workable posting is closed or has changed");
+        throw new ClientError(409, `role_closed_or_changed: the ${provider} posting is closed or has changed`);
       }
       if (live !== "open") {
-        throw new ClientError(503, "workable_revalidation_unavailable: the Workable posting could not be checked; retry later");
+        throw new ClientError(503, `${provider.toLowerCase()}_revalidation_unavailable: the ${provider} posting could not be checked; retry later`);
       }
     }
     const profile = this.profiles ? await this.profiles.get(identity.profileId) : null;
